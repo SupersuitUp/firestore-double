@@ -5,7 +5,7 @@
   "type": "module",
   "exports": {
     ".": {
-      "types": "./src/index.d.ts",
+      "types": "./src/index.d.mts",
       "default": "./src/index.mjs"
     },
     "./package.json": "./package.json"
@@ -28,5 +28,5 @@
     "url": "git+https://github.com/SupersuitUp/firestore-double.git"
   },
   "dependencies": {},
-  "types": "./src/index.d.ts"
+  "types": "./src/index.d.mts"
 }

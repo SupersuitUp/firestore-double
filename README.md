@@ -48,4 +48,4 @@ Composite-index requirements, `Timestamp` conversion (a `Date` comes back a `Dat
 
 ## TypeScript
 
-Types ship in `src/index.d.ts`. Code typed against `Firestore` takes the double with a cast: `createFirestore() as unknown as Firestore`.
+Types ship in `src/index.d.mts`. Code typed against `Firestore` takes the double with a cast: `createFirestore() as unknown as Firestore`.
