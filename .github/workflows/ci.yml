@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+      # Zero dependencies, so there is nothing to install.
+      - run: npm test
+      # The package must run the way the README says, from outside the repo.
+      - run: |
+          cd "$RUNNER_TEMP"
+          node "$GITHUB_WORKSPACE/bin/.mjs" --help

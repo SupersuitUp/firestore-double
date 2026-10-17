@@ -1,0 +1,32 @@
+{
+  "name": "@supersuit/firestore-double",
+  "version": "0.1.0",
+  "description": "An in-memory Firestore for tests that refuses what production refuses: reads after writes in a transaction, updates of missing documents, undefined values.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SupersuitUp/firestore-double.git"
+  },
+  "dependencies": {},
+  "types": "./src/index.d.ts"
+}
