@@ -36,15 +36,32 @@ db.peek("accounts/a");                      // test helper: the stored data
 | Read-only transactions | `runTransaction(fn, { readOnly: true })` refuses writes |
 | Path parity | `doc()` needs an even path, `collection()` an odd one |
 | Queries | `where` (`== != < <= > >= in not-in array-contains array-contains-any`) and `orderBy` drop documents lacking the field; range filters match their own type only; default order is by document id |
+| Cursors | `startAt startAfter endAt endBefore` take field values (no more than the explicit `orderBy`s, or `Too many cursor values specified`) or a snapshot |
+| Implicit order | An inequality filter orders by its field; ties break by document id in the last `orderBy`'s direction |
+| Contention | A transaction whose reads changed before commit runs again, up to `maxAttempts` (default 5), then fails `10 ABORTED` |
+| Batches | `batch()` lands whole or not at all; a committed batch refuses more |
 | Copies | Everything read is a copy; mutating it never edits the store |
 
-Supported surface: `collection(path)`, `doc(path)`, `runTransaction(fn, opts)`; on a reference `get set update create delete collection parent`; on a query `where orderBy limit get count`; on a collection `doc() add()`; in a transaction `get(ref | query) getAll set update create delete`.
+Supported surface: `collection(path)`, `doc(path)`, `getAll(...refs)`, `batch()`, `runTransaction(fn, { readOnly, maxAttempts })`; on a reference `get set update create delete collection parent`; on a query `where orderBy limit startAt startAfter endAt endBefore select get count` (fields as strings or `FieldPath`, including `FieldPath.documentId()`); on a collection `doc() add()`; in a transaction `get(ref | query) getAll set update create delete`.
 
-Test helpers that real Firestore does not have: `db.docs` (a `Map` of full path to data), `db.peek(path)` or `db.peek("coll", "id")`, `db.seed(path, data)`.
+Test helpers that real Firestore does not have: `db.docs` (a `Map` of full path to data), `db.peek(path)` or `db.peek("coll", "id")`, `db.seed(path, data)`, and `db.hooks.afterRead = (path) => ...`, which runs after every document read so a test can slip a write in between a transaction's read and its commit.
+
+## The bucket
+
+```js
+import { createBucket, createFirebase } from "@supersuit/firestore-double";
+
+const { bucket, files, signed, downloads } = createBucket();
+// or both at once, in the shape a mocked firebase-admin module hands out:
+const fb = createFirebase(); // { db, bucket, docs, files, signed, downloads, hooks }
+vi.mock("@/lib/firebase-admin", () => ({ getAdminDb: () => fb.db, getAdminBucket: () => fb.bucket }));
+```
+
+`bucket.file(name)` has `exists save download getMetadata delete copy getSignedUrl`; the bucket has `getFiles deleteFiles` by prefix. A missing object answers `code: 404`, `delete()` of one throws unless `{ ignoreNotFound: true }`, and `getSignedUrl` refuses no action, a bad or past expiry, and a v4 expiry over seven days, as `@google-cloud/storage` does. Signed URLs are `https://signed.example/<name>`; `signed` records every granted request and `downloads` every download.
 
 ## Not modelled
 
-Composite-index requirements, `Timestamp` conversion (a `Date` comes back a `Date`), `FieldValue` sentinels, contention and retries, listeners, batches. Each would be a welcome addition, with a test that fails without it.
+Composite-index requirements, `Timestamp` conversion (a `Date` comes back a `Date`), `FieldValue` sentinels, listeners, and pessimistic locking (a conflicting write is modelled as a retry, never a wait). Each would be a welcome addition, with a test that fails without it.
 
 ## TypeScript
 

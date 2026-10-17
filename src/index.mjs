@@ -13,14 +13,24 @@
 // into ignoreUndefinedProperties, as Firestore does), writes inside a readOnly transaction,
 // document and collection paths of the right parity, and query filters and orderBy dropping
 // documents that lack the field. Results are copies, so mutating one never edits the store.
+// Since 0.2.0: a transaction whose reads changed before it committed runs again, up to maxAttempts
+// (default 5, as the SDK), then fails ABORTED (code 10); an inequality filter orders by its field and
+// ties break by id in the last orderBy's direction; cursors count against orderBy as the SDK counts
+// them; a batch lands whole or not at all and cannot be committed twice; and the bucket double
+// answers a missing object with 404 and refuses a signed URL the SDK would refuse.
 //
 // NOT modelled: composite-index requirements, Timestamp conversion (a Date comes back a Date,
-// where Firestore returns a Timestamp), FieldValue sentinels, contention and retries, listeners.
+// where Firestore returns a Timestamp), FieldValue sentinels, listeners, pessimistic locking (a
+// conflicting write is modelled as a retry of the transaction, never as a wait).
 import { isDeepStrictEqual } from "node:util";
 
 /** firebase-admin's text, copied from @google-cloud/firestore build/src/transaction.js. */
 export const READ_AFTER_WRITE = "Firestore transactions require all reads to be executed before all writes.";
 export const READ_ONLY_WRITE = "Firestore read-only transactions cannot execute writes.";
+
+export const CONTENTION = "Too much contention on these documents. Please try again.";
+const NAME = "__name__"; // FieldPath.documentId()
+const INEQUALITY = new Set(["<", "<=", ">", ">=", "!=", "not-in"]);
 
 const AUTO_ID = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 const autoId = () => Array.from({ length: 20 }, () => AUTO_ID[Math.floor(Math.random() * AUTO_ID.length)]).join("");
@@ -159,7 +169,7 @@ export function createFirestore(settings = {}) {
       id: parts.at(-1), path, firestore: db,
       get parent() { return collectionRef(parts.slice(0, -1).join("/")); },
       collection: (sub) => collectionRef(`${path}/${sub}`),
-      get: async () => snapshot(ref, docs.get(path)),
+      get: () => readThrough(ref, docs.get(path)),
       set: async (data, opts) => { ops.set(docs, path, prepare(data), opts); return {}; },
       update: async (data) => { ops.update(docs, path, prepareUpdate(data)); return {}; },
       create: async (data) => { ops.create(docs, path, prepare(data)); return {}; },
@@ -169,7 +179,54 @@ export function createFirestore(settings = {}) {
     return ref;
   }
 
-  function query(collPath, filters = [], orders = [], lim = null) {
+  // A field path is a string ("a.b") or a FieldPath; FieldPath.documentId() is "__name__".
+  function fieldName(f) {
+    if (typeof f === "string" && f !== "") return f;
+    if (f && Array.isArray(f.segments) && f.segments.length) return f.segments.join(".");
+    throw new Error(`Value for argument "fieldPath" is not a valid field path. Paths must be non-empty strings or FieldPath objects.`);
+  }
+  const idOf = (path) => path.slice(path.lastIndexOf("/") + 1);
+  const valueAt = (path, data, f) => (f === NAME ? { has: true, value: idOf(path) } : fieldValue(data, f));
+  function nameValue(v) {
+    if (v && typeof v === "object" && typeof v.path === "string") return idOf(v.path);
+    if (typeof v !== "string") throw new Error(`The corresponding value for FieldPath.documentId() must be a string or a DocumentReference, but was "${v}".`);
+    if (v.includes("/")) throw new Error(`When querying a collection and ordering by FieldPath.documentId(), the corresponding value must be a plain document ID, but '${v}' contains a slash.`);
+    return v;
+  }
+  // Firestore orders by the explicit orderBys, then every inequality field not already ordered
+  // (lexicographically), then the document id, the implicit ones in the last explicit direction.
+  function effectiveOrders(filters, orders) {
+    const out = orders.slice();
+    const have = new Set(out.map(([f]) => f));
+    const dir = out.length ? out.at(-1)[1] : "asc";
+    for (const f of [...new Set(filters.filter(([f, op]) => INEQUALITY.has(op) && f !== NAME).map(([f]) => f))].sort()) {
+      if (!have.has(f)) { out.push([f, dir]); have.add(f); }
+    }
+    if (!have.has(NAME)) out.push([NAME, dir]);
+    return out;
+  }
+  // Position of a row against a cursor, over the cursor's (prefix of the) orders.
+  function position(path, data, cursor) {
+    for (let i = 0; i < cursor.values.length; i++) {
+      const [f, dir] = cursor.orders[i];
+      const c = compare(valueAt(path, data, f).value, cursor.values[i]);
+      if (c) return dir === "desc" ? -c : c;
+    }
+    return 0;
+  }
+  function project(data, fields) {
+    const out = {};
+    for (const f of fields) {
+      if (f === NAME) continue;
+      const { has, value } = fieldValue(data, f);
+      if (has) setPath(out, f, clone(value));
+    }
+    return out;
+  }
+
+  function query(collPath, state = { filters: [], orders: [], lim: null, start: null, end: null, fields: null }) {
+    const { filters, orders, lim, start, end, fields } = state;
+    const next = (patch) => query(collPath, { ...state, ...patch });
     const depth = collPath.split("/").length + 1;
     const run = () => {
       let rows = [];
@@ -177,31 +234,70 @@ export function createFirestore(settings = {}) {
         if (!path.startsWith(collPath + "/") || path.split("/").length !== depth) continue;
         rows.push([path, data]);
       }
-      rows = rows.filter(([, d]) => filters.every(([f, op, x]) => { const { has, value } = fieldValue(d, f); return has && MATCH[op](value, x); }));
-      rows = rows.filter(([, d]) => orders.every(([f]) => fieldValue(d, f).has));
+      const all = effectiveOrders(filters, orders);
+      rows = rows.filter(([p, d]) => filters.every(([f, op, x]) => { const { has, value } = valueAt(p, d, f); return has && MATCH[op](value, x); }));
+      rows = rows.filter(([p, d]) => all.every(([f]) => valueAt(p, d, f).has));
       rows.sort(([pa, a], [pb, b]) => {
-        for (const [f, dir] of orders) {
-          const c = compare(fieldValue(a, f).value, fieldValue(b, f).value);
+        for (const [f, dir] of all) {
+          const c = compare(valueAt(pa, a, f).value, valueAt(pb, b, f).value);
           if (c) return dir === "desc" ? -c : c;
         }
-        return pa < pb ? -1 : pa > pb ? 1 : 0; // then by document id, as Firestore does
+        return 0;
       });
+      if (start) rows = rows.filter(([p, d]) => { const c = position(p, d, start); return start.before ? c >= 0 : c > 0; });
+      if (end) rows = rows.filter(([p, d]) => { const c = position(p, d, end); return end.before ? c < 0 : c <= 0; });
       if (lim !== null) rows = rows.slice(0, lim);
-      const out = rows.map(([p, d]) => snapshot(docRef(p), d));
+      const out = rows.map(([p, d]) => snapshot(docRef(p), fields ? project(d, fields) : d));
       return { docs: out, size: out.length, empty: out.length === 0, forEach: (fn) => out.forEach(fn) };
+    };
+    // As the SDK: field values count against the explicit orderBys only; a lone snapshot is read
+    // through the implicit order too (inequality fields, then the document id).
+    const cursor = (args, before) => {
+      const snap = args.length === 1 && args[0] && typeof args[0] === "object" && "exists" in args[0] && typeof args[0].data === "function" && args[0].ref ? args[0] : null;
+      let used, values;
+      if (snap) {
+        used = effectiveOrders(filters, orders);
+        const data = snap.data();
+        values = used.map(([f]) => {
+          if (f === NAME) return snap.id;
+          const got = fieldValue(data, f);
+          if (!got.has) throw new Error(`Field "${f}" is missing in the provided DocumentSnapshot. Please provide a document that contains values for all specified orderBy() and where() constraints.`);
+          return got.value;
+        });
+      } else {
+        if (args.length > orders.length) throw new Error("Too many cursor values specified. The specified values must match the orderBy() constraints of the query.");
+        used = orders;
+        values = args.map((v, i) => {
+          if (v === undefined) throw new Error(`Cannot use "undefined" as a Firestore value.`);
+          return orders[i][0] === NAME ? nameValue(v) : v;
+        });
+      }
+      return { orders: used, values, before };
     };
     return {
       where(field, op, value) {
+        const f = fieldName(field);
         if (!MATCH[op]) throw new Error(`Invalid value for argument "opStr". Acceptable values are: ${Object.keys(MATCH).join(", ")}`);
         if (value === undefined) throw new Error(`Value for argument "value" is not a valid query constraint. Cannot use "undefined" as a Firestore value.`);
         if ((op === "in" || op === "not-in" || op === "array-contains-any") && !Array.isArray(value)) throw new Error(`Invalid Query. A non-empty array is required for '${op}' filters.`);
-        return query(collPath, [...filters, [field, op, value]], orders, lim);
+        if (f === NAME) value = Array.isArray(value) ? value.map(nameValue) : nameValue(value);
+        return next({ filters: [...filters, [f, op, value]] });
       },
       orderBy(field, dir = "asc") {
+        const f = fieldName(field);
         if (dir !== "asc" && dir !== "desc") throw new Error(`Invalid value for argument "directionStr". Acceptable values are: asc, desc`);
-        return query(collPath, filters, [...orders, [field, dir]], lim);
+        if (start || end) throw new Error("Cannot specify an orderBy() constraint after calling startAt(), startAfter(), endBefore() or endAt().");
+        return next({ orders: [...orders, [f, dir]] });
       },
-      limit(n) { return query(collPath, filters, orders, n); },
+      limit(n) {
+        if (!Number.isInteger(n) || n < 0) throw new Error(`Value for argument "limit" is not a valid integer.`);
+        return next({ lim: n });
+      },
+      startAt: (...v) => next({ start: cursor(v, true) }),
+      startAfter: (...v) => next({ start: cursor(v, false) }),
+      endBefore: (...v) => next({ end: cursor(v, true) }),
+      endAt: (...v) => next({ end: cursor(v, false) }),
+      select: (...fs) => next({ fields: fs.map(fieldName) }),
       get: async () => run(),
       count: () => ({ get: async () => { const n = run().size; return { data: () => ({ count: n }) }; } }),
       _run: run,
@@ -218,41 +314,90 @@ export function createFirestore(settings = {}) {
     };
   }
 
-  async function runTransaction(fn, opts = {}) {
-    const writes = [];
-    const readOnly = !!opts.readOnly;
-    const write = (op) => (ref, data, setOpts) => {
-      if (readOnly) throw new Error(READ_ONLY_WRITE);
-      const prepared = op === "delete" ? undefined : op === "update" ? prepareUpdate(data) : prepare(data);
-      writes.push([op, ref.path, prepared, setOpts]);
-      return tx;
-    };
-    const tx = {
-      // Synchronous throw, as the SDK does: Transaction.get is not async.
-      get(refOrQuery) {
-        if (writes.length) throw new Error(READ_AFTER_WRITE);
-        if (typeof refOrQuery?._run === "function") return Promise.resolve(refOrQuery._run());
-        return refOrQuery.get();
-      },
-      getAll(...refs) {
-        if (writes.length) throw new Error(READ_AFTER_WRITE);
-        return Promise.all(refs.map((r) => r.get()));
-      },
-      set: write("set"), update: write("update"), create: write("create"), delete: write("delete"),
-    };
-    const result = await fn(tx);
-    // Commit: every write lands, or (on a failed precondition) none does.
+  // Every write lands, or (on a failed precondition) none does.
+  function commit(writes) {
     const next = new Map(docs);
     for (const [op, path, data, setOpts] of writes) ops[op](next, path, data, setOpts);
     docs.clear();
     for (const [k, v] of next) docs.set(k, v);
-    return result;
+  }
+  const prepareFor = (op, data) => (op === "delete" ? undefined : op === "update" ? prepareUpdate(data) : prepare(data));
+
+  function batch() {
+    const writes = [];
+    let committed = false;
+    const guard = () => { if (committed) throw new Error("Cannot modify a WriteBatch that has already been committed."); };
+    const write = (op) => (ref, data, setOpts) => { guard(); writes.push([op, ref.path, prepareFor(op, data), setOpts]); return b; };
+    const b = {
+      set: write("set"), update: write("update"), create: write("create"), delete: write("delete"),
+      commit: async () => { guard(); committed = true; commit(writes); return []; },
+    };
+    return b;
+  }
+
+  async function runTransaction(fn, opts = {}) {
+    const readOnly = !!opts.readOnly;
+    const attempts = readOnly ? 1 : (opts.maxAttempts ?? 5);
+    for (let attempt = 1; ; attempt++) {
+      const writes = [];
+      /** What each read saw, re-checked at commit: a function that answers whether it still holds. */
+      const reads = [];
+      const write = (op) => (ref, data, setOpts) => {
+        if (readOnly) throw new Error(READ_ONLY_WRITE);
+        writes.push([op, ref.path, prepareFor(op, data), setOpts]);
+        return tx;
+      };
+      const readDoc = (ref) => {
+        const seen = clone(docs.get(ref.path));
+        reads.push(() => isDeepStrictEqual(docs.get(ref.path), seen));
+        return readThrough(ref, seen);
+      };
+      const tx = {
+        // Synchronous throw, as the SDK does: Transaction.get is not async.
+        get(refOrQuery) {
+          if (writes.length) throw new Error(READ_AFTER_WRITE);
+          if (typeof refOrQuery?._run === "function") {
+            const got = refOrQuery._run();
+            const seen = got.docs.map((d) => [d.ref.path, d.data()]);
+            reads.push(() => isDeepStrictEqual(refOrQuery._run().docs.map((d) => [d.ref.path, d.data()]), seen));
+            return Promise.resolve(got);
+          }
+          return readDoc(refOrQuery);
+        },
+        getAll(...refs) {
+          if (writes.length) throw new Error(READ_AFTER_WRITE);
+          return Promise.all(refs.map(readDoc));
+        },
+        set: write("set"), update: write("update"), create: write("create"), delete: write("delete"),
+      };
+      const promise = fn(tx);
+      if (!(promise instanceof Promise)) throw new Error("You must return a Promise in your transaction()-callback.");
+      const result = await promise;
+      if (!readOnly && !reads.every((holds) => holds())) {
+        if (attempt < attempts) continue;
+        throw grpcError(10, "ABORTED", CONTENTION);
+      }
+      commit(writes);
+      return result;
+    }
+  }
+
+  /** Test hooks. `afterRead(path)` runs after each document read (a get, a getAll, or one inside a transaction). */
+  const hooks = {};
+  // The snapshot is taken first, so a write made by the hook lands after the read, as a racing writer's would.
+  async function readThrough(ref, data) {
+    const s = snapshot(ref, clone(data));
+    await hooks.afterRead?.(ref.path);
+    return s;
   }
 
   const db = {
     collection: (path) => collectionRef(path),
     doc: (path) => docRef(path),
+    getAll: (...refs) => Promise.all(refs.map((r) => r.get())),
+    batch,
     runTransaction,
+    hooks,
     /** Test helper: everything stored, keyed by full document path. */
     docs,
     /** Test helper: the stored data at a path, given whole ("a/b") or in segments ("a", "b"). */
@@ -261,4 +406,77 @@ export function createFirestore(settings = {}) {
     seed: (path, data) => { segments(path, "document"); docs.set(path, clone(data)); },
   };
   return db;
+}
+
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+const ACTIONS = new Set(["read", "write", "delete", "resumable"]);
+
+/**
+ * An in-memory stand-in for the slice of a Cloud Storage bucket (firebase-admin's getStorage().bucket())
+ * that apps touch. A missing object answers 404 as the service does, a delete of one throws unless
+ * `ignoreNotFound`, and getSignedUrl refuses what @google-cloud/storage refuses (no action, a bad or past
+ * expiry, a v4 expiry beyond seven days). Signed URLs are `https://signed.example/<path>`.
+ */
+export function createBucket() {
+  /** Test helper: every stored object by name. */
+  const files = new Map();
+  /** Test helper: every signing request that was granted, so a test can assert what a link carries. */
+  const signed = [];
+  /** Test helper: every download by name, so a test can assert bytes were (or were not) pulled. */
+  const downloads = [];
+  const missing = (name) => Object.assign(new Error(`No such object: ${name}`), { code: 404 });
+
+  const file = (name) => ({
+    name,
+    exists: async () => [files.has(name)],
+    save: async (bytes, o) => {
+      files.set(name, { bytes: Buffer.from(bytes), contentType: o?.metadata?.contentType ?? o?.contentType, metadata: o?.metadata?.metadata ? { ...o.metadata.metadata } : undefined });
+    },
+    download: async (r) => {
+      downloads.push(name);
+      const f = files.get(name);
+      if (!f) throw missing(name);
+      if (r && (r.start !== undefined || r.end !== undefined)) return [Buffer.from(f.bytes.subarray(r.start ?? 0, (r.end ?? f.bytes.length - 1) + 1))];
+      return [Buffer.from(f.bytes)];
+    },
+    getMetadata: async () => {
+      const f = files.get(name);
+      if (!f) throw missing(name);
+      return [{ name, size: String(f.bytes.length), contentType: f.contentType, metadata: f.metadata ? { ...f.metadata } : undefined }];
+    },
+    delete: async (o) => { if (!files.delete(name) && !o?.ignoreNotFound) throw missing(name); return [{}]; },
+    copy: async (dest) => {
+      const f = files.get(name);
+      if (!f) throw missing(name);
+      const to = typeof dest === "string" ? dest : dest.name;
+      files.set(to, { bytes: Buffer.from(f.bytes), contentType: f.contentType, metadata: f.metadata ? { ...f.metadata } : undefined });
+    },
+    getSignedUrl: async (opts = {}) => {
+      if (!ACTIONS.has(opts.action)) throw new Error("The action is not provided or invalid.");
+      const at = new Date(opts.expires).valueOf();
+      if (opts.expires === undefined || Number.isNaN(at)) throw new Error("The expiration date provided was invalid.");
+      if (at < Date.now()) throw new Error("The expiration date provided was in the past.");
+      if (opts.version === "v4" && at - Date.now() > SEVEN_DAYS_MS) throw new Error("Max allowed expiration is seven days (604800 seconds).");
+      signed.push({ path: name, opts });
+      return [`https://signed.example/${name}`];
+    },
+  });
+
+  const bucket = {
+    file,
+    getFiles: async (q = {}) => [[...files.keys()].filter((n) => n.startsWith(q.prefix ?? "")).map(file)],
+    deleteFiles: async (q = {}) => { for (const n of [...files.keys()]) if (n.startsWith(q.prefix ?? "")) files.delete(n); },
+  };
+  return { bucket, files, signed, downloads };
+}
+
+/**
+ * A database and a bucket together, in the shape app tests pass to a mocked firebase-admin module:
+ * `{ db, bucket, docs, files, signed, downloads, hooks }`.
+ * @param {{ ignoreUndefinedProperties?: boolean }} [settings]
+ */
+export function createFirebase(settings = {}) {
+  const db = createFirestore(settings);
+  const { bucket, files, signed, downloads } = createBucket();
+  return { db, bucket, docs: db.docs, files, signed, downloads, hooks: db.hooks };
 }

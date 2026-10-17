@@ -1,7 +1,7 @@
 {
   "name": "@supersuit/firestore-double",
-  "version": "0.1.1",
-  "description": "An in-memory Firestore for tests that refuses what production refuses: reads after writes in a transaction, updates of missing documents, undefined values.",
+  "version": "0.2.0",
+  "description": "An in-memory Firestore and Cloud Storage bucket for tests that refuse what production refuses: reads after writes in a transaction, updates of missing documents, undefined values, missing objects.",
   "type": "module",
   "exports": {
     ".": {
